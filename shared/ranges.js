@@ -6,8 +6,13 @@
  *   - 单个码位：          U+4E2D / 0x4E2D（无前缀时须含数字，如 4E2D）
  *   - 区间：              U+4E00-U+9FFF / 4E00-9FFF
  *   - 字面字符：          测试，Hello！ 或显式加引号 "ABC"
+ *   - 排除片段：          以 ! 开头，从合并后的正向范围中扣除，
+ *                         如 basic-latin,!U+0041-U+005A、!emoji、!"测试"；
+ *                         可与预设 / 区间 / 字面量混用，全角「！」仍按字面量处理。
  *   - 注意：裸字母 ABC 按字面量处理（避免与十六进制 0xABC 歧义），
  *           写纯字母码位请用 U+XXXX 前缀。
+ *
+ * 解析顺序：先合并全部正向片段，再统一扣除排除区间，最终码位去重并按升序排列。
  *
  * @module shared/ranges
  */
@@ -112,7 +117,7 @@ const PREFIXED_HEX_ONE_RE = /^(?:U\+|0x|\\u)([0-9a-fA-F]{1,6})$/i;
  * 解析范围文本。
  * @param {string} input
  * @returns {{ segments: number[][], count: number, warnings: string[] }}
- * @throws {Error} 输入为空 / 无法识别 / 越界 / 超硬上限
+ * @throws {Error} 输入为空 / 无正向片段 / 无法识别 / 越界 / 超硬上限
  */
 export function parseRangeSpec(input) {
   const warnings = [];
@@ -120,7 +125,8 @@ export function parseRangeSpec(input) {
     throw new Error('范围不能为空');
   }
 
-  const rawSegments = [];
+  const positiveRaw = [];
+  const exclusionRaw = [];
   const tokens = input.split(/[,;，；]+/).map((t) => t.trim()).filter(Boolean);
 
   for (const original of tokens) {
@@ -128,65 +134,34 @@ export function parseRangeSpec(input) {
     const token = original.replace(/\s*-\s*/g, '-');
     if (!token) continue;
 
-    const preset = PRESETS[token.toLowerCase()];
-    if (preset) {
-      if (preset.length === 0) {
-        warnings.push(`预设「${token}」为空，已跳过`);
-      }
-      rawSegments.push(...preset);
-      continue;
+    // 以 ! 开头的片段为排除项（全角「！」是普通字符，可作字面量）
+    const excluded = token.startsWith('!');
+    const body = excluded ? token.slice(1).trim() : token;
+    if (excluded && !body) {
+      throw new Error(`排除项「${original}」缺少范围或字面量，! 后需接要扣除的内容`);
     }
-
-    const quoted = token.match(QUOTED_RE);
-    if (quoted) {
-      const cps = [...quoted[1]].map((ch) => ch.codePointAt(0));
-      for (const cp of cps) rawSegments.push([cp, cp]);
-      continue;
-    }
-
-    // 带 U+/0x 前缀：明确是十六进制
-    const prefixedTwo = token.match(PREFIXED_HEX_RE);
-    const prefixedOne = token.match(PREFIXED_HEX_ONE_RE);
-    if (prefixedTwo || prefixedOne) {
-      const low = parseInt(prefixedTwo ? prefixedTwo[1] : prefixedOne[1], 16);
-      const high = prefixedTwo ? parseInt(prefixedTwo[2], 16) : low;
-      assertInRange(low, original);
-      assertInRange(high, original);
-      if (low > high) {
-        throw new Error(`范围「${original}」起始码位大于结束码位`);
-      }
-      rawSegments.push([low, high]);
-      continue;
-    }
-
-    // 无前缀：仅当整体是「十六进制样式且至少含一个数字」才按码位解析，
-    // 否则视为字面量（解决裸字母 "ABC" 与 0xABC 的歧义）
-    const bare = token.match(BARE_HEX_RANGE_RE);
-    if (bare && /[0-9]/.test(token)) {
-      const low = parseInt(bare[1], 16);
-      const high = bare[2] === undefined ? low : parseInt(bare[2], 16);
-      assertInRange(low, original);
-      assertInRange(high, original);
-      if (low > high) {
-        throw new Error(`范围「${original}」起始码位大于结束码位`);
-      }
-      rawSegments.push([low, high]);
-      continue;
-    }
-
-    // 字面量：逐码位展开（同时支持 BMP 与增补平面）
-    const cps = [...token].map((ch) => ch.codePointAt(0));
-    if (cps.length === 0) {
-      throw new Error(`无法识别的片段：「${original}」`);
-    }
-    for (const cp of cps) rawSegments.push([cp, cp]);
+    const segs = resolveToken(body, original, warnings);
+    (excluded ? exclusionRaw : positiveRaw).push(...segs);
   }
 
-  if (rawSegments.length === 0) {
-    throw new Error('未解析出任何有效范围');
+  if (positiveRaw.length === 0) {
+    throw new Error('未给出任何正向范围：排除项（以 ! 开头）只能从已有范围中扣除，请先添加预设、码位区间或字面量');
   }
 
-  const segments = mergeSegments(rawSegments);
+  // 先合并全部正向片段，再统一扣除排除区间
+  let segments = mergeSegments(positiveRaw);
+  if (exclusionRaw.length) {
+    const exclusions = mergeSegments(exclusionRaw);
+    if (!hasOverlap(segments, exclusions)) {
+      warnings.push(`排除项 ${formatSegments(exclusions)} 与正向范围无交集，未扣除任何码位`);
+    }
+    segments = subtractSegments(segments, exclusions);
+  }
+
+  if (segments.length === 0) {
+    throw new Error('扣除排除项后没有剩余码位，请缩小排除范围');
+  }
+
   const count = segments.reduce((n, [lo, hi]) => n + (hi - lo + 1), 0);
   if (count > HARD_LIMIT) {
     throw new Error(`码位总数 ${count.toLocaleString()} 超出硬上限 ${HARD_LIMIT.toLocaleString()}，请收窄范围`);
@@ -197,6 +172,71 @@ export function parseRangeSpec(input) {
     );
   }
   return { segments, count, warnings };
+}
+
+/**
+ * 解析单个片段（不含 ! 前缀）为若干闭区间。
+ * @param {string} token 已去除连字符两侧空白的片段
+ * @param {string} original 用户输入的原始片段（用于报错提示）
+ * @param {string[]} warnings
+ * @returns {number[][]}
+ */
+function resolveToken(token, original, warnings) {
+  const segs = [];
+
+  const preset = PRESETS[token.toLowerCase()];
+  if (preset) {
+    if (preset.length === 0) {
+      warnings.push(`预设「${token}」为空，已跳过`);
+    }
+    segs.push(...preset);
+    return segs;
+  }
+
+  const quoted = token.match(QUOTED_RE);
+  if (quoted) {
+    const cps = [...quoted[1]].map((ch) => ch.codePointAt(0));
+    for (const cp of cps) segs.push([cp, cp]);
+    return segs;
+  }
+
+  // 带 U+/0x 前缀：明确是十六进制
+  const prefixedTwo = token.match(PREFIXED_HEX_RE);
+  const prefixedOne = token.match(PREFIXED_HEX_ONE_RE);
+  if (prefixedTwo || prefixedOne) {
+    const low = parseInt(prefixedTwo ? prefixedTwo[1] : prefixedOne[1], 16);
+    const high = prefixedTwo ? parseInt(prefixedTwo[2], 16) : low;
+    assertInRange(low, original);
+    assertInRange(high, original);
+    if (low > high) {
+      throw new Error(`范围「${original}」起始码位大于结束码位`);
+    }
+    segs.push([low, high]);
+    return segs;
+  }
+
+  // 无前缀：仅当整体是「十六进制样式且至少含一个数字」才按码位解析，
+  // 否则视为字面量（解决裸字母 "ABC" 与 0xABC 的歧义）
+  const bare = token.match(BARE_HEX_RANGE_RE);
+  if (bare && /[0-9]/.test(token)) {
+    const low = parseInt(bare[1], 16);
+    const high = bare[2] === undefined ? low : parseInt(bare[2], 16);
+    assertInRange(low, original);
+    assertInRange(high, original);
+    if (low > high) {
+      throw new Error(`范围「${original}」起始码位大于结束码位`);
+    }
+    segs.push([low, high]);
+    return segs;
+  }
+
+  // 字面量：逐码位展开（同时支持 BMP 与增补平面）
+  const cps = [...token].map((ch) => ch.codePointAt(0));
+  if (cps.length === 0) {
+    throw new Error(`无法识别的片段：「${original}」`);
+  }
+  for (const cp of cps) segs.push([cp, cp]);
+  return segs;
 }
 
 function assertInRange(cp, original) {
@@ -218,6 +258,43 @@ export function mergeSegments(raw) {
     }
   }
   return out;
+}
+
+/**
+ * 从已合并的正向区间中统一扣除若干已合并的排除区间。
+ * 两组输入均需按起点升序、互不重叠。
+ * @param {number[][]} segments 正向区间
+ * @param {number[][]} exclusions 排除区间
+ * @returns {number[][]}
+ */
+export function subtractSegments(segments, exclusions) {
+  const out = [];
+  let j = 0;
+  for (let [lo, hi] of segments) {
+    while (j < exclusions.length && exclusions[j][1] < lo) j++;
+    for (let k = j; k < exclusions.length && exclusions[k][0] <= hi; k++) {
+      const [exLo, exHi] = exclusions[k];
+      if (exLo > lo) out.push([lo, Math.min(hi, exLo - 1)]);
+      lo = Math.max(lo, exHi + 1);
+      if (lo > hi) break;
+    }
+    if (lo <= hi) out.push([lo, hi]);
+  }
+  return out;
+}
+
+/** 两组已合并区间是否存在交集 */
+function hasOverlap(segments, exclusions) {
+  let i = 0;
+  let j = 0;
+  while (i < segments.length && j < exclusions.length) {
+    const [lo, hi] = segments[i];
+    const [exLo, exHi] = exclusions[j];
+    if (exHi < lo) { j++; continue; }
+    if (exLo > hi) { i++; continue; }
+    return true;
+  }
+  return false;
 }
 
 /** 遍历区间内全部码位 */

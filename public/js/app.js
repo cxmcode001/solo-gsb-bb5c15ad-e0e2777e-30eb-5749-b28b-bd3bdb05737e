@@ -417,12 +417,15 @@ async function runCompare() {
 
   if (!fontA || !fontB) return toast('请选择字体 A 与字体 B', true);
   if (fontA.id === fontB.id) return toast('请选择两个不同的字体', true);
+  const warnBox = $('#compare-warnings');
+  warnBox.innerHTML = '';
   let parsed;
   try {
     parsed = parseRangeSpec(rangeInput);
   } catch (err) {
     return toast(err.message, true);
   }
+  warnBox.innerHTML = parsed.warnings.map((w) => `<div>⚠ ${escapeHtml(w)}</div>`).join('');
 
   state.running = true;
   $('#compare-run').disabled = true;
