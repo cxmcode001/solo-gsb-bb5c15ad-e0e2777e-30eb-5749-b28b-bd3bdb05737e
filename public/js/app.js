@@ -220,6 +220,7 @@ async function runCoverage() {
         rangeInput,
         mode,
         segments: parsed.segments,
+        exclusions: parsed.exclusions,
         rangesText: formatSegments(parsed.segments),
         count: parsed.count,
       },
@@ -414,6 +415,8 @@ async function runCompare() {
   const fontB = getFont($('#compare-font-b').value);
   const rangeInput = $('#compare-range').value;
   const mode = $('input[name="compare-mode"]:checked').value;
+  const warnBox = $('#compare-warnings');
+  warnBox.innerHTML = '';
 
   if (!fontA || !fontB) return toast('请选择字体 A 与字体 B', true);
   if (fontA.id === fontB.id) return toast('请选择两个不同的字体', true);
@@ -423,6 +426,7 @@ async function runCompare() {
   } catch (err) {
     return toast(err.message, true);
   }
+  warnBox.innerHTML = parsed.warnings.map((w) => `<div>⚠ ${escapeHtml(w)}</div>`).join('');
 
   state.running = true;
   $('#compare-run').disabled = true;
@@ -449,6 +453,7 @@ async function runCompare() {
         rangeInput,
         mode,
         segments: parsed.segments,
+        exclusions: parsed.exclusions,
         rangesText: formatSegments(parsed.segments),
         count: parsed.count,
       },

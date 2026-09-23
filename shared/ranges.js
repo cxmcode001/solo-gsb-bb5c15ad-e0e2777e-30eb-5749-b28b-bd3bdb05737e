@@ -6,8 +6,13 @@
  *   - 单个码位：          U+4E2D / 0x4E2D（无前缀时须含数字，如 4E2D）
  *   - 区间：              U+4E00-U+9FFF / 4E00-9FFF
  *   - 字面字符：          测试，Hello！ 或显式加引号 "ABC"
+ *   - 排除项：            以 !（或全角 ！）开头，从正向范围中扣除，
+ *                         如 basic-latin, !U+0041-U+005A,!"0"
  *   - 注意：裸字母 ABC 按字面量处理（避免与十六进制 0xABC 歧义），
- *           写纯字母码位请用 U+XXXX 前缀。
+ *           写纯字母码位请用 U+XXXX 前缀；要检测字面 ! 请写 "!"。
+ *
+ * 解析流程：先合并全部正向片段，再统一扣除排除区间；
+ * 最终码位去重并按升序排列。没有正向片段或表达式格式错误时抛错。
  *
  * @module shared/ranges
  */
@@ -111,8 +116,9 @@ const PREFIXED_HEX_ONE_RE = /^(?:U\+|0x|\\u)([0-9a-fA-F]{1,6})$/i;
 /**
  * 解析范围文本。
  * @param {string} input
- * @returns {{ segments: number[][], count: number, warnings: string[] }}
- * @throws {Error} 输入为空 / 无法识别 / 越界 / 超硬上限
+ * @returns {{ segments: number[][], count: number, warnings: string[], exclusions: number[][] }}
+ *   segments 为扣除排除项后的最终区间（已合并、升序）；exclusions 为合并后的排除区间
+ * @throws {Error} 输入为空 / 无正向片段 / 无法识别 / 越界 / 超硬上限
  */
 export function parseRangeSpec(input) {
   const warnings = [];
@@ -121,11 +127,24 @@ export function parseRangeSpec(input) {
   }
 
   const rawSegments = [];
+  const rawExclusions = [];
   const tokens = input.split(/[,;，；]+/).map((t) => t.trim()).filter(Boolean);
 
   for (const original of tokens) {
+    // 排除项：以 ! 或全角 ！ 开头，主体解析后与正向片段统一结算
+    let target = rawSegments;
+    let body = original;
+    const exclusion = original.match(/^[!！]\s*(.*)$/s);
+    if (exclusion) {
+      body = exclusion[1].trim();
+      if (!body) {
+        throw new Error(`排除项「${original}」缺少要扣除的范围（! 后需跟预设、码位区间或字面量）`);
+      }
+      target = rawExclusions;
+    }
+
     // 仅在连字符两侧去空格，保留字面量内部的空格
-    const token = original.replace(/\s*-\s*/g, '-');
+    const token = body.replace(/\s*-\s*/g, '-');
     if (!token) continue;
 
     const preset = PRESETS[token.toLowerCase()];
@@ -133,14 +152,14 @@ export function parseRangeSpec(input) {
       if (preset.length === 0) {
         warnings.push(`预设「${token}」为空，已跳过`);
       }
-      rawSegments.push(...preset);
+      target.push(...preset);
       continue;
     }
 
     const quoted = token.match(QUOTED_RE);
     if (quoted) {
       const cps = [...quoted[1]].map((ch) => ch.codePointAt(0));
-      for (const cp of cps) rawSegments.push([cp, cp]);
+      for (const cp of cps) target.push([cp, cp]);
       continue;
     }
 
@@ -155,7 +174,7 @@ export function parseRangeSpec(input) {
       if (low > high) {
         throw new Error(`范围「${original}」起始码位大于结束码位`);
       }
-      rawSegments.push([low, high]);
+      target.push([low, high]);
       continue;
     }
 
@@ -170,7 +189,7 @@ export function parseRangeSpec(input) {
       if (low > high) {
         throw new Error(`范围「${original}」起始码位大于结束码位`);
       }
-      rawSegments.push([low, high]);
+      target.push([low, high]);
       continue;
     }
 
@@ -179,15 +198,35 @@ export function parseRangeSpec(input) {
     if (cps.length === 0) {
       throw new Error(`无法识别的片段：「${original}」`);
     }
-    for (const cp of cps) rawSegments.push([cp, cp]);
+    for (const cp of cps) target.push([cp, cp]);
   }
 
   if (rawSegments.length === 0) {
+    if (rawExclusions.length > 0) {
+      throw new Error('表达式只包含排除项，没有要检测的正向范围（! 前请先给出预设、码位区间或字面量）');
+    }
     throw new Error('未解析出任何有效范围');
   }
 
-  const segments = mergeSegments(rawSegments);
+  // 先合并全部正向片段，再统一扣除排除区间；结果去重并保持升序
+  const merged = mergeSegments(rawSegments);
+  const exclusions = mergeSegments(rawExclusions);
+  const segments = exclusions.length ? subtractSegments(merged, exclusions) : merged;
+
+  if (segments.length === 0) {
+    throw new Error('排除项覆盖了全部正向范围，没有剩余可检测的码位');
+  }
+
   const count = segments.reduce((n, [lo, hi]) => n + (hi - lo + 1), 0);
+  if (exclusions.length) {
+    const before = merged.reduce((n, [lo, hi]) => n + (hi - lo + 1), 0);
+    const removed = before - count;
+    warnings.push(
+      removed > 0
+        ? `已按排除项扣除 ${removed.toLocaleString()} 个码位`
+        : '排除项未命中正向范围内的任何码位',
+    );
+  }
   if (count > HARD_LIMIT) {
     throw new Error(`码位总数 ${count.toLocaleString()} 超出硬上限 ${HARD_LIMIT.toLocaleString()}，请收窄范围`);
   }
@@ -196,7 +235,7 @@ export function parseRangeSpec(input) {
       `共 ${count.toLocaleString()} 个码位：真实渲染模式较慢，建议使用「仅 cmap 声明」预估或缩小范围`,
     );
   }
-  return { segments, count, warnings };
+  return { segments, count, warnings, exclusions };
 }
 
 function assertInRange(cp, original) {
@@ -218,6 +257,30 @@ export function mergeSegments(raw) {
     }
   }
   return out;
+}
+
+/**
+ * 从已合并区间中扣除排除区间。
+ * @param {number[][]} segments 已合并（升序、不重叠）的正向区间
+ * @param {number[][]} exclusions 已合并的排除区间
+ * @returns {number[][]} 扣除后的区间（仍升序、不重叠）
+ */
+export function subtractSegments(segments, exclusions) {
+  let result = segments.map(([lo, hi]) => [lo, hi]);
+  for (const [elo, ehi] of exclusions) {
+    const next = [];
+    for (const [lo, hi] of result) {
+      if (ehi < lo || elo > hi) {
+        next.push([lo, hi]);
+        continue;
+      }
+      if (elo > lo) next.push([lo, elo - 1]);
+      if (ehi < hi) next.push([ehi + 1, hi]);
+    }
+    result = next;
+    if (result.length === 0) break;
+  }
+  return result;
 }
 
 /** 遍历区间内全部码位 */

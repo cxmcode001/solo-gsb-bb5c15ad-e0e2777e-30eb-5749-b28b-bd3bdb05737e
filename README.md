@@ -15,7 +15,7 @@
 | 能力 | 说明 |
 | --- | --- |
 | 字体上传 | TTF / OTF / TTC / WOFF / WOFF2（≤30MB），SHA-256 去重，fontkit 解析 name 表与 cmap |
-| 范围输入 | `U+4E2D`、`U+4E00-U+9FFF`、`0x...` 前缀、预设块（basic-latin、cjk-unified、emoji 等 60+）、字面量 `测试，Hello！` |
+| 范围输入 | `U+4E2D`、`U+4E00-U+9FFF`、`0x...` 前缀、预设块（basic-latin、cjk-unified、emoji 等 60+）、字面量 `测试，Hello！`；`!` 前缀为排除项，如 `basic-latin,!U+0041-U+005A` |
 | 真实渲染检测 | Canvas 位图指纹 + `.notdef` 豆腐块探针，三族 CSS 回退栈表决，逐码位判定 |
 | 回退字体识别 | 候选系统字体探针位图比对，输出实际承担渲染的字体名（启发式） |
 | cmap 快速模式 | 仅读取字体 cmap 声明，秒级预估大范围覆盖（不验证真实字形） |
@@ -77,6 +77,13 @@ npm run check                  # 范围解析 / 脚本分类 / cmap 压缩的纯
    - `basic-latin, cjk-unified, emoji`
    - `U+4E00-U+4FFF, U+3000-U+303F`
    - `测试，Hello！`（字面量；纯字母码位请写 `U+0041` 以免与字面量混淆）
+   - **排除项**：以 `!`（也支持全角 `！`）开头的片段会在全部正向片段合并后
+     统一扣除，可与预设、码位区间、字面量混用，最终码位去重并按升序检测：
+     - `basic-latin, !U+0041-U+005A`（基本拉丁去掉大写 A–Z）
+     - `cjk-unified, !U+9FA6`（去掉「龙」）
+     - `ascii-printable, !emoji, !"0123456789"`（再排除预设与字面量）
+   - 没有正向片段（如只写 `!U+41`）、`!` 后为空或排除清空全部码位时，
+     会给出明确报错且不启动检测；要检测字面 `!` 请写成 `"!"`。
 3. 选择模式：
    - **真实渲染检测**（默认）：逐字形 Canvas 检测，约每秒 1k–5k 码位；
    - **仅 cmap 声明**：只读字体表，适合上万码位的快速预估。
@@ -90,6 +97,7 @@ npm run check                  # 范围解析 / 脚本分类 / cmap 压缩的纯
 ### 2. 双字体对比
 
 在 **双字体对比** 页选择字体 A（基线）与 B（新版本），输入同一范围后开始。
+范围写法与覆盖检测完全一致（含 `!` 排除项，如 `basic-latin,!U+0041-U+005A`）。
 输出：B 修复数、B 回归数、回退字体变化数、两版均覆盖 / 均缺失，
 并按脚本列出每个差异码位在两版下的状态；同样支持导出与保存。
 
@@ -144,7 +152,7 @@ npm run check                  # 范围解析 / 脚本分类 / cmap 压缩的纯
   "environment": { "userAgent": "...", "platform": "...", "testedFont": { "...": "..." } },
   "font": { "id": 1, "fullName": "DejaVu Sans", "cmapTotal": 5918 },
   "request": { "mode": "render", "rangeInput": "basic-latin, cjk-unified",
-               "segments": [[32,126],[19968,40959]], "count": 21087 },
+               "segments": [[32,126],[19968,40959]], "exclusions": [], "count": 21087 },
   "summary": {
     "total": 21087, "covered": 3120, "fallback": 88,
     "missingTofu": 17879, "missingBlank": 0, "discrepancy": 2, "rate": 14.80,
@@ -177,7 +185,7 @@ bothCovered, bothMissing }` 以及只包含差异码位的 `groups[].entries
 │       ├── fonts.js      上传(multer) / 列表 / 下载 / 删除 / SHA-256 去重
 │       └── reports.js    报告保存 / 查询 / 删除 / JSON 导出
 ├── shared/               前后端共用的纯 ESM
-│   ├── ranges.js         范围解析（预设 / U+ / 字面量）、区间合并
+│   ├── ranges.js         范围解析（预设 / U+ / 字面量 / ! 排除项）、区间合并与扣除
 │   └── scripts.js        UAX #24 脚本分类（\p{sc=...}，含中文展示名）
 ├── public/
 │   ├── index.html
